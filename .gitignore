@@ -1,4 +1,26 @@
-# Ignore sensitive files
+# Ignore Terraform local data
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+
+# Ignore any Terraform lock or state in subfolders
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.backup
+
+# Ignore backend and provider override files
+*.tfvars
+*.tfvars.json
+terraform.tfstate.d/
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore SSH keys or secrets
 ssh-keys/
 *.pem
 *.key

@@ -1,19 +1,28 @@
 #!/bin/bash
 set -e
+export DEBIAN_FRONTEND=noninteractive
+
+# Log everything
+exec > >(tee /var/log/user-data.log) 2>&1
+echo "Starting user data script at $(date)"
 
 # Update system
-yum update -y
+apt-get update -y
+apt-get upgrade -y
 
 # Install Docker
-yum install -y docker
+apt-get install -y docker.io curl unzip git ca-certificates gnupg lsb-release
 systemctl start docker
 systemctl enable docker
-usermod -a -G docker ec2-user
+usermod -a -G docker ubuntu
 
-# Install Docker Compose
+# Install Docker Compose (standalone)
 curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
 chmod +x /usr/local/bin/docker-compose
 ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+
+# Verify Docker Compose installation
+docker-compose --version
 
 # Install AWS CLI v2
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -21,27 +30,16 @@ unzip awscliv2.zip
 ./aws/install
 rm -rf aws awscliv2.zip
 
-# Install Java for Jenkins
-yum install -y java-11-openjdk java-11-openjdk-devel
-
-# Install Jenkins
-wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
-rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
-yum install -y jenkins
-systemctl start jenkins
-systemctl enable jenkins
-
-# Install Git
-yum install -y git
-
 # Create application directory
-mkdir -p /home/ec2-user/app
-cd /home/ec2-user/app
+mkdir -p /home/ubuntu/app
+cd /home/ubuntu/app
 
 # Configure ECR login
+echo "Configuring ECR login..."
 aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${ecr_repository_url}
+echo "ECR login completed"
 
-# Create docker-compose.yml for LGTM stack + Jenkins
+# Create COMPLETE LGTM + Jenkins + MySQL stack
 cat > docker-compose.yml << 'EOF'
 version: '3.8'
 
@@ -50,7 +48,7 @@ networks:
     driver: bridge
 
 services:
-  # PrestaShop Application (Frontend + Backend)
+  # PrestaShop Application
   prestashop-app:
     image: ${ecr_repository_url}:latest
     container_name: prestashop-app
@@ -61,19 +59,13 @@ services:
       - DB_NAME=prestashop
       - DB_USER=prestashop
       - DB_PASSWD=prestashop123
-      - PS_INSTALL_AUTO=1
     depends_on:
       - mysql
     networks:
       - monitoring
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # MySQL Database for PrestaShop
+  # MySQL Database
   mysql:
     image: mysql:8.0
     container_name: mysql
@@ -82,6 +74,8 @@ services:
       - MYSQL_DATABASE=prestashop
       - MYSQL_USER=prestashop
       - MYSQL_PASSWORD=prestashop123
+    ports:
+      - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     networks:
@@ -95,34 +89,15 @@ services:
     ports:
       - "8080:8080"
       - "50000:50000"
-    environment:
-      - JENKINS_OPTS=--httpPort=8080
     volumes:
       - jenkins-data:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
-      - /usr/bin/docker:/usr/bin/docker
     networks:
       - monitoring
     restart: unless-stopped
     user: root
 
-  # Grafana
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
-    networks:
-      - monitoring
-    restart: unless-stopped
-
-  # Loki
+  # Loki (L in LGTM)
   loki:
     image: grafana/loki:2.9.0
     container_name: loki
@@ -135,20 +110,48 @@ services:
       - monitoring
     restart: unless-stopped
 
-  # Promtail
-  promtail:
-    image: grafana/promtail:2.9.0
-    container_name: promtail
+  # Grafana (G in LGTM)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - /var/log:/var/log:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - ./promtail-config.yml:/etc/promtail/config.yml
-    command: -config.file=/etc/promtail/config.yml
+      - grafana-data:/var/lib/grafana
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
     networks:
       - monitoring
     restart: unless-stopped
 
-  # Prometheus
+  # Tempo (T in LGTM)
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    ports:
+      - "3200:3200"
+      - "14268:14268"
+    volumes:
+      - tempo-data:/tmp/tempo
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Mimir (M in LGTM)
+  mimir:
+    image: grafana/mimir:latest
+    container_name: mimir
+    ports:
+      - "9009:9009"
+    volumes:
+      - mimir-data:/data
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Prometheus (Metrics Collection)
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
@@ -168,12 +171,27 @@ services:
       - monitoring
     restart: unless-stopped
 
+  # Promtail (Log Shipping)
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: promtail
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - monitoring
+    restart: unless-stopped
+
 volumes:
-  grafana-data:
-  loki-data:
-  prometheus-data:
-  jenkins-data:
   mysql-data:
+  jenkins-data:
+  loki-data:
+  grafana-data:
+  tempo-data:
+  mimir-data:
+  prometheus-data:
 EOF
 
 # Create Prometheus config
@@ -187,21 +205,29 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
   
-  - job_name: 'prestashop-app'
-    static_configs:
-      - targets: ['prestashop-app:80']
-    
   - job_name: 'grafana'
     static_configs:
       - targets: ['grafana:3000']
+
+  - job_name: 'jenkins'
+    static_configs:
+      - targets: ['jenkins:8080']
 
   - job_name: 'loki'
     static_configs:
       - targets: ['loki:3100']
 
-  - job_name: 'jenkins'
+  - job_name: 'tempo'
     static_configs:
-      - targets: ['jenkins:8080']
+      - targets: ['tempo:3200']
+
+  - job_name: 'mimir'
+    static_configs:
+      - targets: ['mimir:9009']
+
+  - job_name: 'prestashop-app'
+    static_configs:
+      - targets: ['prestashop-app:80']
 EOF
 
 # Create Promtail config
@@ -236,7 +262,7 @@ scrape_configs:
             tag:
           source: attrs
       - regex:
-          expression: (?P<container_name>(?:[^|]*))\|
+          expression: (?P<container_name>(?:[^|]*))
           source: tag
       - timestamp:
           format: RFC3339Nano
@@ -248,11 +274,8 @@ scrape_configs:
           source: output
 EOF
 
-# Create Grafana provisioning directories
-mkdir -p grafana/provisioning/{datasources,dashboards}
-
 # Create Grafana datasources
-cat > grafana/provisioning/datasources/datasources.yml << 'EOF'
+cat > grafana-datasources.yml << 'EOF'
 apiVersion: 1
 
 datasources:
@@ -266,16 +289,26 @@ datasources:
     type: loki
     access: proxy
     url: http://loki:3100
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+
+  - name: Mimir
+    type: prometheus
+    access: proxy
+    url: http://mimir:9009/prometheus
 EOF
 
 # Set ownership
-chown -R ec2-user:ec2-user /home/ec2-user/app
+chown -R ubuntu:ubuntu /home/ubuntu/app
 
 # Create update script
-cat > /home/ec2-user/update-app.sh << 'EOF'
+cat > /home/ubuntu/update-app.sh << 'EOF'
 #!/bin/bash
 set -e
-cd /home/ec2-user/app
+cd /home/ubuntu/app
 echo "Updating PrestaShop application..."
 aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${ecr_repository_url}
 docker-compose pull prestashop-app
@@ -283,16 +316,34 @@ docker-compose up -d prestashop-app
 echo "PrestaShop application updated successfully!"
 EOF
 
-chmod +x /home/ec2-user/update-app.sh
-chown ec2-user:ec2-user /home/ec2-user/update-app.sh
+chmod +x /home/ubuntu/update-app.sh
+chown ubuntu:ubuntu /home/ubuntu/update-app.sh
 
-# Start the stack
-cd /home/ec2-user/app
-docker-compose up -d
+# Verify Docker is working
+echo "Verifying Docker installation..."
+docker --version
+docker-compose --version
+
+# Start the COMPLETE LGTM + Jenkins + MySQL stack
+echo "Starting ALL Docker services..."
+cd /home/ubuntu/app
+docker-compose up -d mysql jenkins loki grafana tempo mimir prometheus promtail
+
+# Wait a moment and check status
+sleep 10
+echo "Checking container status..."
+docker ps
+
+echo "User data script completed successfully at $(date)"
 
 echo "EC2 initialization completed successfully!"
-echo "Services will be available at:"
-echo "- Application: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3000"
+echo "COMPLETE LGTM + Jenkins + MySQL Stack Ready!"
+echo "Services available at:"
+echo "- PrestaShop App: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3000"
 echo "- Jenkins: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8080"
-echo "- Grafana: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3001"
+echo "- Grafana (G): http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3001 (admin/admin123)"
 echo "- Prometheus: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):9090"
+echo "- Loki (L): http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3100"
+echo "- Tempo (T): http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3200"
+echo "- Mimir (M): http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):9009"
+echo "- MySQL: localhost:3306 (root/root123)"

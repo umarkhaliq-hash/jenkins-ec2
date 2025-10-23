@@ -35,5 +35,5 @@ output "jenkins_url" {
 
 output "ssh_command" {
   description = "SSH command to connect to EC2"
-  value       = "ssh -i ~/.ssh/${var.project_name}-key ec2-user@${module.ec2.public_ip}"
+  value       = "ssh -i ssh-keys/${var.project_name}-key ubuntu@${module.ec2.public_ip}"
 }

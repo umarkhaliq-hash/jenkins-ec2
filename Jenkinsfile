@@ -2,7 +2,7 @@ pipeline {
     agent any
     
     environment {
-        AWS_REGION = 'us-east-1'
+        AWS_REGION = 'us-east-2'
         ECR_REPOSITORY = credentials('ecr-repository-url')
         AWS_ACCOUNT_ID = credentials('aws-account-id')
         IMAGE_TAG = "${BUILD_NUMBER}"
@@ -51,7 +51,7 @@ pipeline {
                 script {
                     sh """
                         EC2_IP=\$(aws ec2 describe-instances --filters "Name=tag:Name,Values=ecommerce-dev-app-server" --query "Reservations[*].Instances[*].PublicIpAddress" --output text --region ${AWS_REGION})
-                        ssh -o StrictHostKeyChecking=no -i ssh-keys/ecommerce-key ec2-user@\$EC2_IP 'bash /home/ec2-user/update-app.sh'
+                        ssh -o StrictHostKeyChecking=no -i ssh-keys/ecommerce-key ubuntu@\$EC2_IP 'bash /home/ubuntu/update-app.sh'
                     """
                 }
             }
